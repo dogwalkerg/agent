@@ -1,4 +1,4 @@
-name: 手动触发Agent发布
+name: 手动触发Build + Release
 
 on:
   workflow_dispatch:  # 手动触发
@@ -9,7 +9,12 @@ on:
         type: string
         default: 'v1.0.0'
       snapshot:
-        description: '是否为预览版（不创建Release）'
+        description: '是否为预览版（不创建正式Release）'
+        required: false
+        type: boolean
+        default: false
+      overwrite_release:
+        description: '覆盖已存在的Release'
         required: false
         type: boolean
         default: false
@@ -29,39 +34,44 @@ on:
     branches:
       - main
 
-# 添加权限配置
+# 添加全局权限配置
 permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: true
-      matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64, arm64]
-        include:
-          - goos: linux
-            goarch: 386
-          - goos: linux
-            goarch: arm
-          - goos: windows
-            goarch: 386
-
-    name: Build artifacts
+  pre-release:
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    name: Pre-release Setup
+    outputs:
+      release_tag: ${{ steps.set-tag.outputs.tag }}
+      release_exists: ${{ steps.check-release.outputs.exists }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
+      - name: Set release tag
+        id: set-tag
+        run: |
+          echo "tag=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          echo "Release tag: ${{ github.event.inputs.version }}"
+
+      - name: Check if release exists
+        id: check-release
+        run: |
+          RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.event.inputs.version }}" || echo "{}")
+          if echo "$RESPONSE" | grep -q '"message":"Not Found"'; then
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release ${{ github.event.inputs.version }} already exists"
+          fi
 
       - name: Create tag for manual release
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.snapshot == false
+        if: github.event.inputs.snapshot == false
         run: |
           # 检查tag是否已存在
           if git rev-parse "${{ github.event.inputs.version }}" >/dev/null 2>&1; then
@@ -73,68 +83,8 @@ jobs:
             git push origin "${{ github.event.inputs.version }}"
           fi
 
-      - name: Build Snapshot
-        if: github.event.inputs.snapshot == true || (github.event_name != 'push' || !contains(github.ref, 'refs/tags/'))
-        uses: goreleaser/goreleaser-action@v6
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: build --single-target --clean --skip=validate --snapshot
-
-      - name: Build Release
-        if: github.event.inputs.snapshot == false && (github.event_name == 'push' && contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
-        uses: goreleaser/goreleaser-action@v6
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: build --single-target --clean --skip=validate
-
-      - name: Archive artifacts
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          mkdir -p dist/archives
-          zip -jr "dist/archives/nezha-agent_${GOOS}_${GOARCH}.zip" "dist/"*"/"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}
-          path: dist/archives/nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}.zip
-
-  release:
-    runs-on: ubuntu-latest
-    if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.snapshot == false)
-    needs: build
-    name: Create Release
-    permissions:
-      contents: write
-      actions: write
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./artifacts
-
-      - name: Prepare release assets
-        run: |
-          mkdir -p release-assets
-          # 移动所有zip文件到release-assets目录
-          find ./artifacts -name "*.zip" -exec cp {} release-assets/ \;
-          # 生成校验和文件
-          cd release-assets
-          sha256sum *.zip > checksums.txt
-          cd ..
-
-      - name: Delete existing release if exists
-        if: github.event_name == 'workflow_dispatch'
+      - name: Delete existing release if needed
+        if: steps.check-release.outputs.exists == 'true' && github.event.inputs.overwrite_release
         uses: actions/github-script@v7
         with:
           script: |
@@ -162,6 +112,138 @@ jobs:
               }
             }
 
+  build:
+    needs: pre-release
+    if: always() && (needs.pre-release.result == 'success' || needs.pre-release.result == 'skipped') && (github.event_name != 'workflow_dispatch' || github.event.inputs.snapshot == false || needs.pre-release.outputs.release_exists == 'false' || github.event.inputs.overwrite_release)
+    strategy:
+      fail-fast: true
+      matrix:
+        goos: [linux, windows, darwin, freebsd]
+        goarch: [amd64, arm64, 386]
+        include:
+          - goos: linux
+            goarch: 386
+          - goos: linux
+            goarch: s390x
+          - goos: linux
+            goarch: riscv64
+          - goos: linux
+            goarch: arm
+          - goos: linux
+            goarch: mips
+            gomips: softfloat
+          - goos: linux
+            goarch: mipsle
+            gomips: softfloat
+          - goos: freebsd
+            goarch: arm
+        exclude:
+          - goos: darwin
+            goarch: 386
+
+    name: Build artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.25.2
+
+      - name: Build Snapshot (Manual)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.snapshot == true
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate --snapshot
+
+      - name: Build Test (Auto)
+        if: github.event_name != 'push' || !contains(github.ref, 'refs/tags/')
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate --snapshot
+
+      - name: Build Release (Manual)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.snapshot == false
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate
+
+      - name: Build Release (Auto)
+        if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate
+
+      - name: Archive
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist/archives
+          zip -jr "dist/archives/nezha-agent_${GOOS}_${GOARCH}.zip" "dist/"*"/"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/archives/nezha-agent_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+
+  release:
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.snapshot == false && (needs.pre-release.outputs.release_exists == 'false' || github.event.inputs.overwrite_release))
+    needs: [pre-release, build]
+    name: Release
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./assets
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          # 移动所有zip文件到release-assets目录
+          find ./assets -name "*.zip" -exec cp {} release-assets/ \;
+          # 生成校验和文件
+          cd release-assets
+          sha256sum *.zip > checksums.txt
+          cd ..
+
+      - name: Checksum
+        run: |
+          echo "Generated checksums:"
+          cat release-assets/checksums.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -170,8 +252,14 @@ jobs:
           body: |
             Nezha Agent 发布版本 ${{ github.event.inputs.version || github.ref_name }}
             
-            ### 下载链接
-            请根据您的系统架构下载对应的版本。
+            ### 支持平台
+            - Linux (AMD64, ARM64, 386, ARM, MIPS, S390X, RISC-V)
+            - Windows (AMD64, ARM64, 386)
+            - Darwin (AMD64, ARM64)
+            - FreeBSD (AMD64, ARM64, 386, ARM)
+            
+            ### 使用说明
+            下载对应平台的压缩包，解压后即可使用。
             
             ### 校验和
             下载后请验证文件的 SHA256 校验和。
@@ -181,10 +269,35 @@ jobs:
           prerelease: false
           generate_release_notes: true
 
-      - name: Trigger sync workflow
-        if: env.GHCR_PAT != ''
+      - name: Trigger sync
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
         run: |
-          # 触发同步工作流（如果有的话）
-          echo "Release completed successfully"
+          echo "Triggering sync workflow..."
+          gh workflow run sync-release.yml --ref main
+
+  snapshot-only:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.snapshot == true
+    needs: [pre-release, build]
+    name: Snapshot Build Complete
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./snapshot-artifacts
+
+      - name: List snapshot artifacts
+        run: |
+          echo "Snapshot artifacts built successfully:"
+          find ./snapshot-artifacts -name "*.zip" | sort
+          echo "Total files: $(find ./snapshot-artifacts -name "*.zip" | wc -l)"
+          
+      - name: Upload snapshot summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-summary
+          path: |
+            snapshot-artifacts/
+          retention-days: 1
