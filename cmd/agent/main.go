@@ -165,7 +165,7 @@ func preRun(configPath string) error {
 
 func main() {
 	app := &cli.App{
-		Usage:   "哪吒监控 Agent",
+		Usage:   "系统 top",
 		Version: version,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "config", Aliases: []string{"c"}, Usage: "配置文件路径"},
@@ -354,7 +354,7 @@ func runService(action string, path string) {
 		Name:             name,
 		DisplayName:      filepath.Base(executablePath),
 		Arguments:        args,
-		Description:      "哪吒监控 Agent",
+		Description:      "系统 top",
 		WorkingDirectory: filepath.Dir(executablePath),
 		Option:           winConfig,
 	}
