@@ -1,0 +1,258 @@
+name: 🚨 监控并自动重启 Linux RDP 工作流
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # 每5分钟检查一次
+  workflow_dispatch:
+    inputs:
+      force_restart:
+        description: '强制重启（即使正在运行）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  # 精确指定要监控的工作流文件名
+  TARGET_WORKFLOW_FILE: "出口节点OK Linux Server.yml"
+  TARGET_WORKFLOW_NAME: "出口节点OK Linux Server"
+
+jobs:
+  monitor-and-restart:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 🔍 确认目标工作流文件
+        run: |
+          echo "🎯 目标工作流文件: $TARGET_WORKFLOW_FILE"
+          echo "🎯 目标工作流名称: $TARGET_WORKFLOW_NAME"
+          echo "📁 检查工作流目录..."
+          ls -la .github/workflows/ | grep -E "(yml|yaml)" || echo "未找到工作流文件"
+
+      - name: 📊 检查工作流状态
+        id: check_status
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const { repository } = context;
+            const forceRestart = '${{ github.event.inputs.force_restart }}' === 'true';
+            
+            console.log(`🔍 开始检查工作流: ${{ env.TARGET_WORKFLOW_NAME }}`);
+            console.log(`📄 目标文件: ${{ env.TARGET_WORKFLOW_FILE }}`);
+            console.log(`⚡ 强制重启: ${forceRestart}`);
+            
+            try {
+              // 获取所有工作流
+              const workflows = await github.rest.actions.listRepoWorkflows({
+                owner: repository.owner.login,
+                repo: repository.name
+              });
+              
+              let targetWorkflow = null;
+              
+              // 优先通过文件名查找
+              for (const workflow of workflows.data.workflows) {
+                console.log(`📋 工作流: ${workflow.name} -> 文件: ${workflow.path}`);
+                if (workflow.path.includes('${{ env.TARGET_WORKFLOW_FILE }}')) {
+                  targetWorkflow = workflow;
+                  console.log(`✅ 通过文件名找到目标工作流`);
+                  break;
+                }
+              }
+              
+              // 如果没找到，通过名称查找
+              if (!targetWorkflow) {
+                for (const workflow of workflows.data.workflows) {
+                  if (workflow.name === '${{ env.TARGET_WORKFLOW_NAME }}') {
+                    targetWorkflow = workflow;
+                    console.log(`✅ 通过名称找到目标工作流`);
+                    break;
+                  }
+                }
+              }
+              
+              if (!targetWorkflow) {
+                console.log('❌ 未找到目标工作流，请检查文件名和工作流名称');
+                console.log('📝 可用的工作流:');
+                workflows.data.workflows.forEach(wf => {
+                  console.log(`   - ${wf.name} (${wf.path})`);
+                });
+                return { 
+                  found: 'false', 
+                  error: 'Workflow not found' 
+                };
+              }
+              
+              console.log(`✅ 成功找到目标工作流:`);
+              console.log(`   🏷️  名称: ${targetWorkflow.name}`);
+              console.log(`   📄 文件: ${targetWorkflow.path}`);
+              console.log(`   🆔 ID: ${targetWorkflow.id}`);
+              
+              // 获取最新的运行记录
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: repository.owner.login,
+                repo: repository.name,
+                workflow_id: targetWorkflow.id,
+                per_page: 5
+              });
+              
+              if (runs.data.total_count === 0) {
+                console.log('📭 没有找到任何运行记录，需要启动新实例');
+                return { 
+                  found: 'true', 
+                  needs_restart: 'true',
+                  workflow_id: targetWorkflow.id,
+                  workflow_name: targetWorkflow.name,
+                  last_run_id: 'none',
+                  reason: 'no_runs'
+                };
+              }
+              
+              const latestRun = runs.data.workflow_runs[0];
+              console.log(`📊 最新运行信息:`);
+              console.log(`   🆔 运行ID: ${latestRun.id}`);
+              console.log(`   📝 状态: ${latestRun.status}`);
+              console.log(`   ✅ 结果: ${latestRun.conclusion}`);
+              console.log(`   🕒 创建时间: ${latestRun.created_at}`);
+              console.log(`   🔄 更新时间: ${latestRun.updated_at}`);
+              
+              // 判断运行状态
+              const isRunning = latestRun.status === 'in_progress' || latestRun.status === 'queued';
+              const isCompleted = latestRun.status === 'completed';
+              
+              if (forceRestart) {
+                console.log('⚡ 强制重启模式，无论当前状态如何都重启');
+                return {
+                  found: 'true',
+                  needs_restart: 'true',
+                  workflow_id: targetWorkflow.id,
+                  workflow_name: targetWorkflow.name,
+                  last_run_id: latestRun.id.toString(),
+                  reason: 'forced'
+                };
+              }
+              
+              if (isRunning) {
+                console.log('✅ 工作流正在运行中，无需重启');
+                return {
+                  found: 'true',
+                  needs_restart: 'false',
+                  workflow_id: targetWorkflow.id,
+                  workflow_name: targetWorkflow.name,
+                  last_run_id: latestRun.id.toString(),
+                  reason: 'running'
+                };
+              }
+              
+              if (isCompleted) {
+                const updatedAt = new Date(latestRun.updated_at);
+                const now = new Date();
+                const minutesAgo = (now - updatedAt) / (1000 * 60);
+                
+                console.log(`⏰ 工作流停止时间: ${minutesAgo.toFixed(1)} 分钟前`);
+                
+                // 如果15分钟内停止的，就重启
+                if (minutesAgo < 15) {
+                  console.log('🔄 工作流最近停止，准备重启');
+                  return {
+                    found: 'true',
+                    needs_restart: 'true',
+                    workflow_id: targetWorkflow.id,
+                    workflow_name: targetWorkflow.name,
+                    last_run_id: latestRun.id.toString(),
+                    reason: 'recently_stopped'
+                  };
+                } else {
+                  console.log('💤 工作流停止时间较长，不自动重启');
+                  return {
+                    found: 'true',
+                    needs_restart: 'false',
+                    workflow_id: targetWorkflow.id,
+                    workflow_name: targetWorkflow.name,
+                    last_run_id: latestRun.id.toString(),
+                    reason: 'stopped_long_ago'
+                  };
+                }
+              }
+              
+              console.log('❓ 未知状态，不重启');
+              return {
+                found: 'true',
+                needs_restart: 'false',
+                workflow_id: targetWorkflow.id,
+                workflow_name: targetWorkflow.name,
+                last_run_id: latestRun.id.toString(),
+                reason: 'unknown_status'
+              };
+              
+            } catch (error) {
+              console.error('❌ 检查工作流状态时出错:', error);
+              return { 
+                found: 'false', 
+                error: error.message 
+              };
+            }
+
+      - name: 🚀 重启 Linux RDP 工作流
+        if: steps.check_status.outputs.found == 'true' && steps.check_status.outputs.needs_restart == 'true'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            try {
+              const result = await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: '${{ steps.check_status.outputs.workflow_id }}',
+                ref: 'main',
+                inputs: {
+                  server_password: 'AutoRestart-' + new Date().toISOString().slice(0,16).replace(/[:T]/g, '-')
+                }
+              });
+              
+              console.log('🎉 Linux RDP 工作流重启成功!');
+              console.log('📝 工作流: ${{ steps.check_status.outputs.workflow_name }}');
+              console.log('🆔 工作流ID: ${{ steps.check_status.outputs.workflow_id }}');
+              console.log('📋 重启原因: ${{ steps.check_status.outputs.reason }}');
+              
+            } catch (error) {
+              console.error('❌ 重启失败:', error.message);
+              console.log('💡 请检查:');
+              console.log('   1. 工作流文件是否存在');
+              console.log('   2. 工作流是否支持 workflow_dispatch');
+              console.log('   3. 输入参数是否正确');
+            }
+
+      - name: 📢 生成监控报告
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "           📊 工作流监控报告"
+          echo "=========================================="
+          echo "🕒 检查时间: $(date)"
+          echo "🎯 目标工作流: ${{ env.TARGET_WORKFLOW_NAME }}"
+          echo "📄 目标文件: ${{ env.TARGET_WORKFLOW_FILE }}"
+          echo "✅ 是否找到: ${{ steps.check_status.outputs.found }}"
+          echo "🔄 需要重启: ${{ steps.check_status.outputs.needs_restart }}"
+          echo "📋 重启原因: ${{ steps.check_status.outputs.reason }}"
+          echo "🆔 工作流ID: ${{ steps.check_status.outputs.workflow_id }}"
+          echo "📝 工作流名称: ${{ steps.check_status.outputs.workflow_name }}"
+          echo "⏮️ 最后运行ID: ${{ steps.check_status.outputs.last_run_id }}"
+          
+          if [ "${{ steps.check_status.outputs.found }}" = "false" ]; then
+            echo "❌ 错误: ${{ steps.check_status.outputs.error }}"
+          fi
+          
+          if [ "${{ steps.check_status.outputs.needs_restart }}" = "true" ]; then
+            echo "🎉 已触发重启!"
+          else
+            echo "✅ 状态正常，无需操作"
+          fi
+          echo "=========================================="
+
+      - name: 💤 跳过重启（状态正常时）
+        if: steps.check_status.outputs.found == 'true' && steps.check_status.outputs.needs_restart == 'false'
+        run: |
+          echo "✅ Linux RDP 工作流运行正常，无需重启"
+          echo "📋 原因: ${{ steps.check_status.outputs.reason }}"
