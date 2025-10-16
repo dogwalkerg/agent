@@ -1,0 +1,180 @@
+name: 出口节点OK Linux VNC
+
+on:
+  workflow_dispatch:
+    inputs:
+      vnc_password:
+        description: 'VNC Password (min 6 characters)'
+        required: true
+        default: 'LinuxVNC@2024!'
+        type: string
+
+jobs:
+  secure-vnc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure VNC Server
+        run: |
+          # 更新系统并安装必要的软件包
+          sudo apt-get update
+          sudo apt-get install -y xfce4 xfce4-goodies tightvncserver firefox
+
+      - name: Create VNC User and Set Password
+        run: |
+          # 创建新用户
+          sudo useradd -m -s /bin/bash vncuser
+          echo "vncuser:${{ github.event.inputs.vnc_password }}" | sudo chpasswd
+          sudo usermod -aG sudo vncuser
+          
+          echo "VNC_PASSWORD=${{ github.event.inputs.vnc_password }}" >> $GITHUB_ENV
+
+      - name: Install and Configure VNC Server
+        run: |
+          # 切换到 vncuser 用户配置 VNC
+          sudo -u vncuser mkdir -p /home/vncuser/.vnc
+          
+          # 设置 VNC 密码（非系统密码）
+          echo "${{ github.event.inputs.vnc_password }}" | sudo -u vncuser vncpasswd -f > /home/vncuser/.vnc/passwd
+          sudo chmod 600 /home/vncuser/.vnc/passwd
+          
+          # 创建 VNC 启动脚本
+          sudo -u vncuser cat > /home/vncuser/.vnc/xstartup << 'EOF'
+#!/bin/bash
+xrdb $HOME/.Xresources
+startxfce4 &
+EOF
+          
+          sudo chmod +x /home/vncuser/.vnc/xstartup
+
+      - name: Install Tailscale
+        run: |
+          # 安装 Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          # 启用 IP 转发（Linux 出口节点必需）
+          echo 'net.ipv4.ip_forward = 1' | sudo tee -a /etc/sysctl.conf
+          echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
+
+      - name: Configure Exit Node
+        run: |
+          # 检测本地子网
+          SUBNET=$(ip route | grep -oP 'default via \K[0-9.]+' | head -1 | sed 's/\.[0-9]*$/.0\/24/')
+          if [ -z "$SUBNET" ]; then
+            SUBNET="10.0.0.0/24"  # 默认子网
+          fi
+          echo "ADVERTISE_ROUTES=$SUBNET" >> $GITHUB_ENV
+          echo "Detected subnet for route advertising: $SUBNET"
+
+      - name: Establish Tailscale Connection
+        run: |
+          # 启动 Tailscale 并宣告出口节点
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-runner-$GITHUB_RUN_ID \
+            --advertise-exit-node \
+            --advertise-routes=$ADVERTISE_ROUTES
+          
+          # 等待获取 Tailscale IP
+          for i in {1..12}; do
+            TS_IP=$(tailscale ip -4 2>/dev/null || echo "")
+            if [[ -n "$TS_IP" && "$TS_IP" =~ ^100\. ]]; then
+              echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+              break
+            fi
+            echo "Waiting for Tailscale IP... ($i/12)"
+            sleep 5
+          done
+          
+          if [ -z "$TAILSCALE_IP" ]; then
+            echo "Failed to get Tailscale IP"
+            exit 1
+          fi
+
+      - name: Start VNC Server and Services
+        run: |
+          # 启动 VNC 服务器（端口 5901）
+          sudo -u vncuser vncserver :1 -geometry 1280x800 -depth 24 -localhost no
+          
+          # 配置防火墙（如果有）
+          sudo ufw allow 5901/tcp 2>/dev/null || true
+          
+          # 显示服务状态
+          echo "VNC Server started on display :1 (port 5901)"
+
+      - name: Verify Services
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          echo "Advertised Routes: $ADVERTISE_ROUTES"
+          echo "VNC Password: $VNC_PASSWORD"
+          
+          # 检查 Tailscale 状态
+          tailscale status
+          
+          # 检查 VNC 服务
+          sudo -u vncuser vncserver -list
+
+      - name: Display Connection Information
+        run: |
+          echo ""
+          echo "================================================"
+          echo "🚀 LINUX VNC & EXIT NODE READY"
+          echo "================================================"
+          echo "🖥️  VNC Connection:"
+          echo "   Address: $TAILSCALE_IP:1"
+          echo "   Username: vncuser"
+          echo "   Password: $VNC_PASSWORD"
+          echo ""
+          echo "🔧 Exit Node Configuration:"
+          echo "   Node Name: gh-runner-$GITHUB_RUN_ID"
+          echo "   Advertised Routes: $ADVERTISE_ROUTES"
+          echo ""
+          echo "📋 Next Steps:"
+          echo "   1. Go to: https://login.tailscale.com/admin/machines"
+          echo "   2. Find device: gh-runner-$GITHUB_RUN_ID"
+          echo "   3. Click '...' → Edit route settings"
+          echo "   4. Enable: 'Use as exit node' and subnet routes"
+          echo "   5. Connect VNC client to: $TAILSCALE_IP:1"
+          echo ""
+          echo "💡 VNC Client Usage:"
+          echo "   - TigerVNC: vncviewer $TAILSCALE_IP:1"
+          echo "   - RealVNC: connect to $TAILSCALE_IP:1"
+          echo "   - Remmina: use VNC protocol"
+          echo "================================================"
+          echo ""
+
+      - name: Maintain Active Connection
+        run: |
+          echo "🔄 Starting service maintenance loop..."
+          START_TIME=$(date +%s)
+          MAX_DURATION=3300  # 55 minutes in seconds
+          
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+            REMAINING=$((MAX_DURATION - ELAPSED))
+            
+            if [ $REMAINING -le 0 ]; then
+              echo "⏰ Session time nearly complete"
+              break
+            fi
+            
+            MINUTES=$((REMAINING / 60))
+            SECONDS=$((REMAINING % 60))
+            
+            echo "[$(date '+%H:%M:%S')] Services active - Time remaining: ${MINUTES}m ${SECONDS}s"
+            
+            # 检查服务状态
+            if ! tailscale status > /dev/null 2>&1; then
+              echo "⚠️  Tailscale connection issue detected"
+            fi
+            
+            if ! pgrep -f "vncserver :1" > /dev/null; then
+              echo "⚠️  VNC server not running, restarting..."
+              sudo -u vncuser vncserver :1 -geometry 1280x800 -depth 24 -localhost no > /dev/null 2>&1
+            fi
+            
+            sleep 60
+          done
