@@ -1,0 +1,224 @@
+name: 出口节点OK哪吒 Linux RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_password:
+        description: 'RDP Password'
+        required: true
+        default: 'MyRDP@2025!'
+        type: string
+
+jobs:
+  secure-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: 设置 Debian 13 运行器
+        run: |
+          # 更新系统并安装基础工具
+          sudo apt-get update
+          sudo apt-get install -y curl wget gnupg
+
+      - name: 安装和配置 XRDP
+        run: |
+          # 安装 XRDP 和相关组件
+          sudo apt-get install -y xrdp xorgxrdp xorg
+          
+          # 配置 XRDP
+          sudo sed -i 's/port=3389/port=3389/g' /etc/xrdp/xrdp.ini
+          sudo sed -i 's/security_layer=negotiate/security_layer=rdp/g' /etc/xrdp/xrdp.ini
+          sudo sed -i 's/crypt_level=high/crypt_level=none/g' /etc/xrdp/xrdp.ini
+          
+          # 启动 XRDP 服务
+          sudo systemctl enable xrdp
+          sudo systemctl start xrdp
+          
+          # 开放防火墙端口
+          sudo ufw allow 3389
+          sudo ufw --force enable
+
+      - name: 创建 RDP 用户
+        run: |
+          # 使用输入变量作为密码
+          RDP_PASSWORD="${{ github.event.inputs.rdp_password }}"
+          
+          # 创建用户并设置密码
+          sudo useradd -m -s /bin/bash WINRDP 2>/dev/null || true
+          echo "WINRDP:$RDP_PASSWORD" | sudo chpasswd
+          
+          # 添加到管理员组
+          sudo usermod -aG sudo WINRDP
+          
+          # 设置自动登录（可选）
+          echo "echo 'exec startxfce4' >> ~WINRDP/.xinitrc" | sudo bash
+          sudo chown WINRDP:WINRDP /home/WINRDP/.xinitrc
+          
+          echo "RDP_PASSWORD=$RDP_PASSWORD" >> $GITHUB_ENV
+
+      - name: 安装桌面环境
+        run: |
+          # 安装 XFCE 桌面环境（轻量级）
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies
+          
+          # 配置 XRDP 使用 XFCE
+          echo "xfce4-session" > ~/.xsession
+          sudo cp ~/.xsession /home/WINRDP/
+          sudo chown WINRDP:WINRDP /home/WINRDP/.xsession
+
+      - name: 安装 Tailscale
+        run: |
+          # 添加 Tailscale GPG 密钥和仓库
+          curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          
+          # 安装 Tailscale
+          sudo apt-get update
+          sudo apt-get install -y tailscale
+
+      - name: 配置出口节点
+        run: |
+          # 启用 IP 转发
+          echo 'net.ipv4.ip_forward = 1' | sudo tee -a /etc/sysctl.conf
+          echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
+          
+          # 检测本地子网
+          SUBNET=$(ip route | grep default | awk '{print $3}' | cut -d. -f1-3).0/24
+          echo "ADVERTISE_ROUTES=$SUBNET" >> $GITHUB_ENV
+          echo "检测到的子网: $SUBNET"
+
+      - name: 建立 Tailscale 连接
+        run: |
+          # 启动 Tailscale 服务
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-runner-$GITHUB_RUN_ID \
+            --advertise-exit-node \
+            --advertise-routes=$ADVERTISE_ROUTES
+          
+          # 等待获取 Tailscale IP
+          for i in {1..10}; do
+            TAILSCALE_IP=$(tailscale ip -4)
+            if [ -n "$TAILSCALE_IP" ]; then
+              break
+            fi
+            sleep 5
+          done
+          
+          if [ -z "$TAILSCALE_IP" ]; then
+            echo "错误: 无法获取 Tailscale IP"
+            exit 1
+          fi
+          
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          echo "Tailscale IP: $TAILSCALE_IP"
+
+      - name: 安装 KO30RE 服务
+        run: |
+          # 创建安装目录
+          sudo mkdir -p /opt/ko30re
+          cd /opt/ko30re
+
+          # 创建环境文件
+          sudo tee .env > /dev/null <<EOF
+          NZ_SERVER=ko30re.916919.xyz:443
+          NZ_TLS=true
+          NZ_CLIENT_SECRET=kO3irsfICJvxqZFUE2bVHGbv2YQpd0Re
+          EOF
+
+          # 创建 systemd 服务
+          sudo tee /etc/systemd/system/ko30re.service > /dev/null <<EOF
+          [Unit]
+          Description=KO30RE Client Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/opt/ko30re
+          EnvironmentFile=/opt/ko30re/.env
+          ExecStartPre=/bin/bash -c 'curl -L https://r2.916919.xyz/ko30re/top.sh -o /opt/ko30re/top.sh && chmod +x /opt/ko30re/top.sh'
+          ExecStart=/bin/bash /opt/ko30re/top.sh
+          Restart=always
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # 启用并启动服务
+          sudo systemctl daemon-reload
+          sudo systemctl enable ko30re.service
+          sudo systemctl start ko30re.service
+
+          # 等待服务启动并检查状态
+          sleep 5
+          echo "KO30RE 服务状态:"
+          sudo systemctl status ko30re.service --no-pager
+
+          # 检查进程
+          echo "运行中的进程:"
+          ps aux | grep -v grep | grep top.sh || echo "未找到 top.sh 进程"
+
+      - name: 验证服务状态
+        run: |
+          # 验证 RDP 服务
+          echo "=== 验证 RDP 服务 ==="
+          sudo systemctl status xrdp --no-pager
+
+          # 验证 Tailscale 服务
+          echo "=== 验证 Tailscale 服务 ==="
+          sudo tailscale status
+
+          # 验证 KO30RE 服务
+          echo "=== 验证 KO30RE 服务 ==="
+          sudo systemctl status ko30re.service --no-pager
+
+          # 检查 KO30RE 日志
+          echo "=== KO30RE 最新日志 ==="
+          sudo journalctl -u ko30re.service -n 10 --no-pager
+
+      - name: 验证 RDP 可访问性
+        run: |
+          # 安装网络测试工具
+          sudo apt-get install -y nmap
+          
+          # 测试 RDP 端口连通性
+          echo "测试 RDP 端口连通性..."
+          if nmap -p 3389 $TAILSCALE_IP | grep -q "open"; then
+            echo "✓ RDP 端口 3389 已开放"
+          else
+            echo "✗ RDP 端口 3389 无法访问"
+            exit 1
+          fi
+
+      - name: 维护连接并显示信息
+        run: |
+          echo ""
+          echo "=== RDP 访问信息 ==="
+          echo "地址: $TAILSCALE_IP"
+          echo "用户名: WINRDP"
+          echo "密码: $RDP_PASSWORD"
+          echo ""
+          echo "=== 出口节点配置 ==="
+          echo "出口节点名称: gh-runner-$GITHUB_RUN_ID"
+          echo "广告路由: $ADVERTISE_ROUTES"
+          echo ""
+          echo "=== KO30RE 服务状态 ==="
+          sudo systemctl is-active ko30re.service && echo "KO30RE: 运行中" || echo "KO30RE: 未运行"
+          echo ""
+          echo "启用出口节点步骤:"
+          echo "1. 访问 https://login.tailscale.com/admin/machines"
+          echo "2. 找到设备 'gh-runner-$GITHUB_RUN_ID'"
+          echo "3. 点击 '...' → 编辑路由设置"
+          echo "4. 启用 '用作出口节点' 和子网路由"
+          echo "===================="
+          echo ""
+          
+          # 显示 KO30RE 实时日志
+          echo "开始显示 KO30RE 服务日志..."
+          sudo journalctl -u ko30re.service -f
