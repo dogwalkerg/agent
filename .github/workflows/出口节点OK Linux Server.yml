@@ -1,4 +1,4 @@
-name: 出口节点OK哪吒 Linux
+name: 出口节点OK Linux Server
 
 on:
   workflow_dispatch:
