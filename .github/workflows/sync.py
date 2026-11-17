@@ -168,11 +168,13 @@ def sync_to_gitee(
     print(f"Gitee release id: {release_id}")
     asset_api_uri = f"{release_api_uri}/{release_id}/attach_files"
 
-    for file_path in files:
+    def upload_asset(file_path):
         success = False
-
         for attempt in range(1, MAX_RETRIES + 1):
             try:
+                print(
+                    f"Uploading {owner}/{repo}: {os.path.basename(file_path)} "
+                    f"(attempt {attempt}/{MAX_RETRIES})", flush=True)
                 upload_url = f"{asset_api_uri}?access_token={access_token}"
                 result = subprocess.run(
                     ['curl', '--silent', '--show-error', '--connect-timeout', '20',
@@ -187,7 +189,7 @@ def sync_to_gitee(
                     asset_name = asset_info.get('name', os.path.basename(file_path))
                     print(f"Successfully uploaded {owner}/{repo}: {asset_name}!", flush=True)
                     success = True
-                    break
+                    return asset_name
                 print(
                     f"Upload {os.path.basename(file_path)} returned HTTP "
                     f"{status_code} (attempt {attempt}/{MAX_RETRIES}): "
@@ -203,6 +205,15 @@ def sync_to_gitee(
             raise RuntimeError(
                 f"Failed to upload {os.path.basename(file_path)} after "
                 f"{MAX_RETRIES} attempts")
+
+    upload_workers = min(6, len(files))
+    print(
+        f"Uploading {len(files)} assets to {owner}/{repo} with "
+        f"{upload_workers} parallel workers", flush=True)
+    with ThreadPoolExecutor(max_workers=upload_workers) as pool:
+        futures = [pool.submit(upload_asset, file_path) for file_path in files]
+        for future in as_completed(futures):
+            future.result()
 
     # 仅保留最新 Release 以防超出 Gitee 仓库配额
     try:
