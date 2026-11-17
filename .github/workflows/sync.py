@@ -5,6 +5,7 @@ import hashlib
 from github import Auth, Github
 
 REQUEST_TIMEOUT = 30
+UPLOAD_TIMEOUT = (30, 600)
 MAX_RETRIES = 3
 GITEE_REPOSITORIES = (
     ("hashgopeed", "agent", "GITEE_TOKEN"),
@@ -185,7 +186,7 @@ def sync_to_gitee(
                         asset_api_uri,
                         params={'access_token': access_token},
                         files={'file': upload_file},
-                        timeout=REQUEST_TIMEOUT)
+                        timeout=UPLOAD_TIMEOUT)
                 if asset_api_response.status_code == 201:
                     asset_info = asset_api_response.json()
                     asset_name = asset_info.get('name', os.path.basename(file_path))
