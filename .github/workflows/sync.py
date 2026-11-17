@@ -73,7 +73,7 @@ def delete_gitee_releases(latest_id, client, uri, token):
 
 def sync_to_gitee(tag: str, body: str, files: slice):
     release_id = ""
-    owner = "naibahq"
+    owner = "hashgopeed"
     repo = "agent"
     release_api_uri = f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases"
     api_client = requests.Session()
