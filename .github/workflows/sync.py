@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import hashlib
@@ -26,62 +28,33 @@ def get_github_latest_release():
     if release:
         print(f"Latest release tag is: {release.tag_name}", flush=True)
         print(f"Latest release info is: {release.body}", flush=True)
-        files = []
-        download_headers = {'Accept': 'application/octet-stream'}
+        assets = list(release.get_assets())
+        print(f"Downloading {len(assets)} assets with GitHub CLI", flush=True)
+        gh_env = os.environ.copy()
         if github_token:
-            download_headers['Authorization'] = f'Bearer {github_token}'
-        assets = [(asset.browser_download_url, asset.name)
-                  for asset in release.get_assets()]
-
-        def download_asset(item):
-            url, name = item
-            print(f"Downloading {name}", flush=True)
-            for attempt in range(1, MAX_RETRIES + 1):
-                response = None
-                try:
-                    started_at = time.monotonic()
-                    downloaded_bytes = 0
-                    with requests.get(
-                            url, headers=download_headers, allow_redirects=True,
-                            stream=True, timeout=(10, 120)) as response:
-                        response.raise_for_status()
-                        with open(name, 'wb') as output_file:
-                            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                                if chunk:
-                                    output_file.write(chunk)
-                                    downloaded_bytes += len(chunk)
-                                    if time.monotonic() - started_at > DOWNLOAD_DEADLINE:
-                                        raise requests.exceptions.Timeout(
-                                            f"download exceeded {DOWNLOAD_DEADLINE}s")
-                    print(f"Downloaded {name} ({downloaded_bytes // (1024 * 1024)} MiB)", flush=True)
-                    return name
-                except (OSError, requests.exceptions.RequestException) as err:
-                    status = 'no response' if response is None else str(response.status_code)
-                    print(
-                        f"Download {name} failed (HTTP {status}, attempt "
-                        f"{attempt}/{MAX_RETRIES}): {err}", flush=True)
-                    if attempt == MAX_RETRIES:
-                        raise RuntimeError(
-                            f"Failed to download {name} after {MAX_RETRIES} attempts") from err
-                    time.sleep(2 ** (attempt - 1))
-
-        print(f"Starting parallel download of {len(assets)} assets", flush=True)
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [pool.submit(download_asset, item) for item in assets]
-            for future in as_completed(futures):
-                name = future.result()
-                file_abs_path = get_abs_path(name)
-                if not os.path.isfile(file_abs_path):
-                    raise RuntimeError(f"Downloaded asset is missing: {file_abs_path}")
-                files.append(file_abs_path)
-        files.sort()
+            gh_env['GH_TOKEN'] = github_token
+        try:
+            subprocess.run(
+                ['gh', 'release', 'download', release.tag_name,
+                 '--repo', 'nezhahq/agent', '--dir', '.', '--clobber'],
+                env=gh_env, check=True, timeout=900)
+        except (OSError, subprocess.SubprocessError) as err:
+            raise RuntimeError(f"GitHub CLI release download failed: {err}") from err
+        files = sorted(get_abs_path(asset.name) for asset in assets)
+        missing = [path for path in files if not os.path.isfile(path)]
+        if missing:
+            raise RuntimeError(f"Downloaded assets are missing: {missing}")
         print(f"All {len(files)} assets downloaded; starting checksum verification", flush=True)
         print('Checking file integrities')
         verify_checksum(get_abs_path("checksums.txt"))
-        for owner, repo, token_name in GITEE_REPOSITORIES:
-            print(f"Syncing release {release.tag_name} to Gitee {owner}/{repo}")
-            sync_to_gitee(
-                release.tag_name, release.body, files, owner, repo, token_name)
+        with ThreadPoolExecutor(max_workers=len(GITEE_REPOSITORIES)) as pool:
+            futures = [
+                pool.submit(sync_to_gitee, release.tag_name, release.body,
+                            files, owner, repo, token_name)
+                for owner, repo, token_name in GITEE_REPOSITORIES
+            ]
+            for future in as_completed(futures):
+                future.result()
     else:
         print("No releases found.")
 
@@ -200,23 +173,26 @@ def sync_to_gitee(
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                with open(file_path, 'rb') as upload_file:
-                    asset_api_response = api_client.post(
-                        asset_api_uri,
-                        params={'access_token': access_token},
-                        files={'file': upload_file},
-                        timeout=UPLOAD_TIMEOUT)
-                if asset_api_response.status_code == 201:
-                    asset_info = asset_api_response.json()
+                upload_url = f"{asset_api_uri}?access_token={access_token}"
+                result = subprocess.run(
+                    ['curl', '--silent', '--show-error', '--connect-timeout', '20',
+                     '--max-time', '600', '--speed-time', '60', '--speed-limit', '1024',
+                     '--form', f'file=@{file_path}', '--write-out', '\n%{http_code}',
+                     upload_url],
+                    capture_output=True, text=True, timeout=620)
+                output, _, status_text = result.stdout.rpartition('\n')
+                status_code = int(status_text) if status_text.isdigit() else 0
+                if status_code == 201:
+                    asset_info = json.loads(output)
                     asset_name = asset_info.get('name', os.path.basename(file_path))
-                    print(f"Successfully uploaded {asset_name}!")
+                    print(f"Successfully uploaded {owner}/{repo}: {asset_name}!", flush=True)
                     success = True
                     break
                 print(
                     f"Upload {os.path.basename(file_path)} returned HTTP "
-                    f"{asset_api_response.status_code} (attempt {attempt}/{MAX_RETRIES}): "
-                    f"{asset_api_response.text[:500]}")
-            except (OSError, requests.exceptions.RequestException) as err:
+                    f"{status_code} (attempt {attempt}/{MAX_RETRIES}): "
+                    f"{(output or result.stderr)[:500]}")
+            except (OSError, ValueError, subprocess.SubprocessError) as err:
                 print(
                     f"Upload {os.path.basename(file_path)} failed "
                     f"(attempt {attempt}/{MAX_RETRIES}): {err}")
