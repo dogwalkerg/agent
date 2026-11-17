@@ -7,13 +7,14 @@ from github import Github
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
 GITEE_REPOSITORIES = (
-    ("hashgopeed", "agent"),
-    ("naibahq", "agent"),
+    ("hashgopeed", "agent", "GITEE_TOKEN"),
+    ("naibahq", "agent", "GITEE_TOKEN2"),
 )
 
 
 def get_github_latest_release():
-    g = Github()
+    github_token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+    g = Github(login_or_token=github_token) if github_token else Github()
     repo = g.get_repo("nezhahq/agent")
     release = repo.get_latest_release()
     if release:
@@ -35,9 +36,10 @@ def get_github_latest_release():
             files.append(file_abs_path)
         print('Checking file integrities')
         verify_checksum(get_abs_path("checksums.txt"))
-        for owner, repo in GITEE_REPOSITORIES:
+        for owner, repo, token_name in GITEE_REPOSITORIES:
             print(f"Syncing release {release.tag_name} to Gitee {owner}/{repo}")
-            sync_to_gitee(release.tag_name, release.body, files, owner, repo)
+            sync_to_gitee(
+                release.tag_name, release.body, files, owner, repo, token_name)
     else:
         print("No releases found.")
 
@@ -77,7 +79,9 @@ def delete_gitee_releases(latest_id, client, uri, token):
                 f"Request failed with status code {delete_response.status_code}")
 
 
-def sync_to_gitee(tag: str, body: str, files: slice, owner: str, repo: str):
+def sync_to_gitee(
+        tag: str, body: str, files: slice, owner: str, repo: str,
+        token_name: str):
     release_id = ""
     release_api_uri = f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases"
     api_client = requests.Session()
@@ -86,9 +90,9 @@ def sync_to_gitee(tag: str, body: str, files: slice, owner: str, repo: str):
         'Content-Type': 'application/json'
     })
 
-    access_token = os.environ.get('GITEE_TOKEN', '').strip()
+    access_token = os.environ.get(token_name, '').strip()
     if not access_token:
-        raise RuntimeError('GITEE_TOKEN is missing or empty')
+        raise RuntimeError(f'{token_name} is missing or empty')
 
     # Replace an existing release with the same tag so both mirrors stay identical.
     existing_response = api_client.get(

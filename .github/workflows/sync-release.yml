@@ -8,7 +8,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      GITEE_TOKEN2: ${{ secrets.GITEE_TOKEN2 }}
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Sync to Gitee
