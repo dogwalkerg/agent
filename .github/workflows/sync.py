@@ -41,18 +41,18 @@ def get_github_latest_release():
                 try:
                     started_at = time.monotonic()
                     downloaded_bytes = 0
-                    response = requests.get(
-                        url, headers=download_headers, allow_redirects=True,
-                        stream=True, timeout=(10, 120))
-                    response.raise_for_status()
-                    with open(name, 'wb') as output_file:
-                        for chunk in response.iter_content(chunk_size=1024 * 1024):
-                            if chunk:
-                                output_file.write(chunk)
-                                downloaded_bytes += len(chunk)
-                                if time.monotonic() - started_at > DOWNLOAD_DEADLINE:
-                                    raise requests.exceptions.Timeout(
-                                        f"download exceeded {DOWNLOAD_DEADLINE}s")
+                    with requests.get(
+                            url, headers=download_headers, allow_redirects=True,
+                            stream=True, timeout=(10, 120)) as response:
+                        response.raise_for_status()
+                        with open(name, 'wb') as output_file:
+                            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                                if chunk:
+                                    output_file.write(chunk)
+                                    downloaded_bytes += len(chunk)
+                                    if time.monotonic() - started_at > DOWNLOAD_DEADLINE:
+                                        raise requests.exceptions.Timeout(
+                                            f"download exceeded {DOWNLOAD_DEADLINE}s")
                     print(f"Downloaded {name} ({downloaded_bytes // (1024 * 1024)} MiB)", flush=True)
                     return name
                 except (OSError, requests.exceptions.RequestException) as err:
@@ -65,6 +65,7 @@ def get_github_latest_release():
                             f"Failed to download {name} after {MAX_RETRIES} attempts") from err
                     time.sleep(2 ** (attempt - 1))
 
+        print(f"Starting parallel download of {len(assets)} assets", flush=True)
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = [pool.submit(download_asset, item) for item in assets]
             for future in as_completed(futures):
@@ -74,6 +75,7 @@ def get_github_latest_release():
                     raise RuntimeError(f"Downloaded asset is missing: {file_abs_path}")
                 files.append(file_abs_path)
         files.sort()
+        print(f"All {len(files)} assets downloaded; starting checksum verification", flush=True)
         print('Checking file integrities')
         verify_checksum(get_abs_path("checksums.txt"))
         for owner, repo, token_name in GITEE_REPOSITORIES:
