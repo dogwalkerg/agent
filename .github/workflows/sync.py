@@ -5,6 +5,7 @@ import hashlib
 from github import Auth, Github
 
 REQUEST_TIMEOUT = 30
+DOWNLOAD_DEADLINE = 180
 # Gitee may take longer than a fixed socket timeout while accepting large ZIPs.
 # The workflow-level timeout remains the outer safety limit.
 UPLOAD_TIMEOUT = None
@@ -36,6 +37,8 @@ def get_github_latest_release():
             response = None
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
+                    started_at = time.monotonic()
+                    downloaded_bytes = 0
                     response = download_session.get(
                         url, headers=download_headers, allow_redirects=True,
                         stream=True, timeout=(10, 120))
@@ -44,6 +47,14 @@ def get_github_latest_release():
                         for chunk in response.iter_content(chunk_size=1024 * 1024):
                             if chunk:
                                 output_file.write(chunk)
+                                downloaded_bytes += len(chunk)
+                                if time.monotonic() - started_at > DOWNLOAD_DEADLINE:
+                                    raise requests.exceptions.Timeout(
+                                        f"download exceeded {DOWNLOAD_DEADLINE}s")
+                                if downloaded_bytes % (10 * 1024 * 1024) < len(chunk):
+                                    print(
+                                        f"Downloading {name}: {downloaded_bytes // (1024 * 1024)} MiB",
+                                        flush=True)
                     print(f"Downloaded {name}")
                     break
                 except (OSError, requests.exceptions.RequestException) as err:
