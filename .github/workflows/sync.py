@@ -6,6 +6,10 @@ from github import Github
 
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
+GITEE_REPOSITORIES = (
+    ("hashgopeed", "agent"),
+    ("naibahq", "agent"),
+)
 
 
 def get_github_latest_release():
@@ -31,7 +35,9 @@ def get_github_latest_release():
             files.append(file_abs_path)
         print('Checking file integrities')
         verify_checksum(get_abs_path("checksums.txt"))
-        sync_to_gitee(release.tag_name, release.body, files)
+        for owner, repo in GITEE_REPOSITORIES:
+            print(f"Syncing release {release.tag_name} to Gitee {owner}/{repo}")
+            sync_to_gitee(release.tag_name, release.body, files, owner, repo)
     else:
         print("No releases found.")
 
@@ -71,10 +77,8 @@ def delete_gitee_releases(latest_id, client, uri, token):
                 f"Request failed with status code {delete_response.status_code}")
 
 
-def sync_to_gitee(tag: str, body: str, files: slice):
+def sync_to_gitee(tag: str, body: str, files: slice, owner: str, repo: str):
     release_id = ""
-    owner = "hashgopeed"
-    repo = "agent"
     release_api_uri = f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases"
     api_client = requests.Session()
     api_client.headers.update({
@@ -85,6 +89,32 @@ def sync_to_gitee(tag: str, body: str, files: slice):
     access_token = os.environ.get('GITEE_TOKEN', '').strip()
     if not access_token:
         raise RuntimeError('GITEE_TOKEN is missing or empty')
+
+    # Replace an existing release with the same tag so both mirrors stay identical.
+    existing_response = api_client.get(
+        release_api_uri,
+        params={'access_token': access_token, 'page': 1, 'per_page': 100},
+        timeout=REQUEST_TIMEOUT)
+    if existing_response.status_code == 200:
+        for existing_release in existing_response.json():
+            if existing_release.get('tag_name') == tag:
+                existing_id = existing_release.get('id')
+                if existing_id:
+                    delete_response = api_client.delete(
+                        f"{release_api_uri}/{existing_id}",
+                        params={'access_token': access_token},
+                        timeout=REQUEST_TIMEOUT)
+                    if delete_response.status_code not in (204, 404):
+                        raise RuntimeError(
+                            f"Failed to replace {owner}/{repo} release {tag}: "
+                            f"HTTP {delete_response.status_code} {delete_response.text[:500]}")
+                    print(f"Replaced existing {owner}/{repo} release {tag}")
+                break
+    elif existing_response.status_code not in (401, 403, 404):
+        raise RuntimeError(
+            f"Unable to inspect {owner}/{repo} releases: HTTP "
+            f"{existing_response.status_code} {existing_response.text[:500]}")
+
     release_data = {
         'access_token': access_token,
         'tag_name': tag,
@@ -161,7 +191,7 @@ def sync_to_gitee(tag: str, body: str, files: slice):
         print(e)
 
     api_client.close()
-    print("Sync is completed!")
+    print(f"Sync is completed for {owner}/{repo}!")
 
 
 def get_abs_path(path: str):
