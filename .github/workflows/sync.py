@@ -133,11 +133,22 @@ def sync_to_gitee(
             f"Unable to inspect {owner}/{repo} releases: HTTP "
             f"{existing_response.status_code} {existing_response.text[:500]}")
 
+    official_links = '\n'.join(
+        f"- [{os.path.basename(path)}](https://github.com/nezhahq/agent/releases/download/{tag}/{os.path.basename(path)}) "
+        f"`sha256:{compute_sha256(path)}`"
+        for path in files
+    )
+    mirror_body = (
+        f"{body}\n\n## Official GitHub downloads\n"
+        "Gitee may reject executable archives during server-side scanning. "
+        "All source release assets remain available below.\n\n"
+        f"{official_links}"
+    )
     release_data = {
         'access_token': access_token,
         'tag_name': tag,
         'name': tag,
-        'body': body,
+        'body': mirror_body,
         'prerelease': False,
         'target_commitish': 'main'
     }
@@ -190,6 +201,32 @@ def sync_to_gitee(
                     print(f"Successfully uploaded {owner}/{repo}: {asset_name}!", flush=True)
                     success = True
                     return asset_name
+                if (status_code == 403 and
+                        'malicious file detected and rejected' in output):
+                    asset_name = os.path.basename(file_path)
+                    pointer_path = f"{file_path}.download.txt"
+                    with open(pointer_path, 'w', encoding='utf-8') as pointer:
+                        pointer.write(
+                            f"Gitee rejected {asset_name} during server-side scanning.\n"
+                            f"Official download: https://github.com/nezhahq/agent/releases/download/{tag}/{asset_name}\n"
+                            f"SHA-256: {compute_sha256(file_path)}\n")
+                    print(
+                        f"Gitee rejected {owner}/{repo}: {asset_name}; "
+                        "uploading a verified download pointer instead", flush=True)
+                    pointer_result = subprocess.run(
+                        ['curl', '--silent', '--show-error', '--connect-timeout', '20',
+                         '--max-time', '120', '--form', f'file=@{pointer_path}',
+                         '--write-out', '\n%{http_code}', upload_url],
+                        capture_output=True, text=True, timeout=140)
+                    pointer_output, _, pointer_status = pointer_result.stdout.rpartition('\n')
+                    if pointer_status == '201':
+                        print(
+                            f"Uploaded {owner}/{repo}: {os.path.basename(pointer_path)}",
+                            flush=True)
+                        return os.path.basename(pointer_path)
+                    raise RuntimeError(
+                        f"Failed to upload pointer for {asset_name}: "
+                        f"HTTP {pointer_status} {(pointer_output or pointer_result.stderr)[:500]}")
                 print(
                     f"Upload {os.path.basename(file_path)} returned HTTP "
                     f"{status_code} (attempt {attempt}/{MAX_RETRIES}): "
