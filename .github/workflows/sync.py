@@ -5,7 +5,9 @@ import hashlib
 from github import Auth, Github
 
 REQUEST_TIMEOUT = 30
-UPLOAD_TIMEOUT = (30, 600)
+# Gitee may take longer than a fixed socket timeout while accepting large ZIPs.
+# The workflow-level timeout remains the outer safety limit.
+UPLOAD_TIMEOUT = None
 MAX_RETRIES = 3
 GITEE_REPOSITORIES = (
     ("hashgopeed", "agent", "GITEE_TOKEN"),
