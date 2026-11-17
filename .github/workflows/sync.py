@@ -2,7 +2,7 @@ import os
 import time
 import requests
 import hashlib
-from github import Github
+from github import Auth, Github
 
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
@@ -14,26 +14,48 @@ GITEE_REPOSITORIES = (
 
 def get_github_latest_release():
     github_token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
-    g = Github(login_or_token=github_token) if github_token else Github()
+    g = Github(auth=Auth.Token(github_token)) if github_token else Github()
     repo = g.get_repo("nezhahq/agent")
     release = repo.get_latest_release()
     if release:
         print(f"Latest release tag is: {release.tag_name}")
         print(f"Latest release info is: {release.body}")
         files = []
+        download_session = requests.Session()
+        download_headers = {'Accept': 'application/octet-stream'}
+        if github_token:
+            download_headers['Authorization'] = f'Bearer {github_token}'
         for asset in release.get_assets():
             url = asset.browser_download_url
             name = asset.name
-
-            response = requests.get(url, timeout=REQUEST_TIMEOUT)
-            if response.status_code == 200:
-                with open(name, 'wb') as f:
-                    f.write(response.content)
-                print(f"Downloaded {name}")
-            else:
-                print(f"Failed to download {name}")
+            print(f"Downloading {name}")
+            response = None
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    response = download_session.get(
+                        url, headers=download_headers, allow_redirects=True,
+                        stream=True, timeout=(10, 120))
+                    response.raise_for_status()
+                    with open(name, 'wb') as output_file:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if chunk:
+                                output_file.write(chunk)
+                    print(f"Downloaded {name}")
+                    break
+                except (OSError, requests.exceptions.RequestException) as err:
+                    status = 'no response' if response is None else str(response.status_code)
+                    print(
+                        f"Download {name} failed (HTTP {status}, attempt "
+                        f"{attempt}/{MAX_RETRIES}): {err}")
+                    if attempt == MAX_RETRIES:
+                        raise RuntimeError(
+                            f"Failed to download {name} after {MAX_RETRIES} attempts") from err
+                    time.sleep(2 ** (attempt - 1))
             file_abs_path = get_abs_path(asset.name)
+            if not os.path.isfile(file_abs_path):
+                raise RuntimeError(f"Downloaded asset is missing: {file_abs_path}")
             files.append(file_abs_path)
+        download_session.close()
         print('Checking file integrities')
         verify_checksum(get_abs_path("checksums.txt"))
         for owner, repo, token_name in GITEE_REPOSITORIES:
@@ -227,9 +249,7 @@ def verify_checksum(checksum_file: str):
             print(f"{file}: OK")
         else:
             print(f"{file}: FAIL (expected {checksum}, got {computed_hash})")
-            print("Will run the download process again")
-            get_github_latest_release()
-            break
+            raise RuntimeError(f"Checksum verification failed for {file}")
 
 
 get_github_latest_release()
