@@ -17,12 +17,13 @@ GITEE_REPOSITORIES = (
 
 def get_github_latest_release():
     github_token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
-    g = Github(auth=Auth.Token(github_token)) if github_token else Github()
+    g = (Github(auth=Auth.Token(github_token), timeout=REQUEST_TIMEOUT)
+         if github_token else Github(timeout=REQUEST_TIMEOUT))
     repo = g.get_repo("nezhahq/agent")
     release = repo.get_latest_release()
     if release:
-        print(f"Latest release tag is: {release.tag_name}")
-        print(f"Latest release info is: {release.body}")
+        print(f"Latest release tag is: {release.tag_name}", flush=True)
+        print(f"Latest release info is: {release.body}", flush=True)
         files = []
         download_session = requests.Session()
         download_headers = {'Accept': 'application/octet-stream'}
@@ -31,7 +32,7 @@ def get_github_latest_release():
         for asset in release.get_assets():
             url = asset.browser_download_url
             name = asset.name
-            print(f"Downloading {name}")
+            print(f"Downloading {name}", flush=True)
             response = None
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
