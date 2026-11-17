@@ -4,6 +4,9 @@ import requests
 import hashlib
 from github import Github
 
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+
 
 def get_github_latest_release():
     g = Github()
@@ -17,7 +20,7 @@ def get_github_latest_release():
             url = asset.browser_download_url
             name = asset.name
 
-            response = requests.get(url)
+            response = requests.get(url, timeout=REQUEST_TIMEOUT)
             if response.status_code == 200:
                 with open(name, 'wb') as f:
                     f.write(response.content)
@@ -52,7 +55,8 @@ def delete_gitee_releases(latest_id, client, uri, token):
             release_ids.append(block['id'])
 
     print(f'Current release ids: {release_ids}')
-    release_ids.remove(latest_id)
+    if latest_id in release_ids:
+        release_ids.remove(latest_id)
 
     for id in release_ids:
         release_uri = f"{uri}/{id}"
@@ -78,7 +82,9 @@ def sync_to_gitee(tag: str, body: str, files: slice):
         'Content-Type': 'application/json'
     })
 
-    access_token = os.environ['GITEE_TOKEN']
+    access_token = os.environ.get('GITEE_TOKEN', '').strip()
+    if not access_token:
+        raise RuntimeError('GITEE_TOKEN is missing or empty')
     release_data = {
         'access_token': access_token,
         'tag_name': tag,
@@ -87,24 +93,29 @@ def sync_to_gitee(tag: str, body: str, files: slice):
         'prerelease': False,
         'target_commitish': 'main'
     }
-    while True:
+    release_api_response = None
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
             release_api_response = api_client.post(
-                release_api_uri, json=release_data, timeout=30)
-            release_api_response.raise_for_status()
-            break
-        except requests.exceptions.Timeout as errt:
-            print(f"Request timed out: {errt} Retrying in 60 seconds...")
-            time.sleep(60)
+                release_api_uri, json=release_data, timeout=REQUEST_TIMEOUT)
+            if release_api_response.status_code == 201:
+                break
+            print(
+                f"Create release returned HTTP {release_api_response.status_code} "
+                f"(attempt {attempt}/{MAX_RETRIES}): {release_api_response.text[:500]}")
         except requests.exceptions.RequestException as err:
-            print(f"Request failed: {err}")
-            break
-    if release_api_response.status_code == 201:
-        release_info = release_api_response.json()
-        release_id = release_info.get('id')
-    else:
-        print(
-            f"Request failed with status code {release_api_response.status_code}")
+            print(f"Create release failed (attempt {attempt}/{MAX_RETRIES}): {err}")
+        if attempt < MAX_RETRIES:
+            time.sleep(2 ** (attempt - 1))
+
+    if release_api_response is None or release_api_response.status_code != 201:
+        status = 'no response' if release_api_response is None else str(release_api_response.status_code)
+        raise RuntimeError(f"Gitee release creation failed after {MAX_RETRIES} attempts (HTTP {status})")
+
+    release_info = release_api_response.json()
+    release_id = release_info.get('id')
+    if not release_id:
+        raise RuntimeError('Gitee release response did not contain an id')
 
     print(f"Gitee release id: {release_id}")
     asset_api_uri = f"{release_api_uri}/{release_id}/attach_files"
@@ -112,22 +123,35 @@ def sync_to_gitee(tag: str, body: str, files: slice):
     for file_path in files:
         success = False
 
-        while not success:
-            files = {
-                'file': open(file_path, 'rb')
-            }
-
-            asset_api_response = requests.post(
-                asset_api_uri, params={'access_token': access_token}, files=files)
-
-            if asset_api_response.status_code == 201:
-                asset_info = asset_api_response.json()
-                asset_name = asset_info.get('name')
-                print(f"Successfully uploaded {asset_name}!")
-                success = True
-            else:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                with open(file_path, 'rb') as upload_file:
+                    asset_api_response = api_client.post(
+                        asset_api_uri,
+                        params={'access_token': access_token},
+                        files={'file': upload_file},
+                        timeout=REQUEST_TIMEOUT)
+                if asset_api_response.status_code == 201:
+                    asset_info = asset_api_response.json()
+                    asset_name = asset_info.get('name', os.path.basename(file_path))
+                    print(f"Successfully uploaded {asset_name}!")
+                    success = True
+                    break
                 print(
-                    f"Request failed with status code {asset_api_response.status_code}")
+                    f"Upload {os.path.basename(file_path)} returned HTTP "
+                    f"{asset_api_response.status_code} (attempt {attempt}/{MAX_RETRIES}): "
+                    f"{asset_api_response.text[:500]}")
+            except (OSError, requests.exceptions.RequestException) as err:
+                print(
+                    f"Upload {os.path.basename(file_path)} failed "
+                    f"(attempt {attempt}/{MAX_RETRIES}): {err}")
+            if attempt < MAX_RETRIES:
+                time.sleep(2 ** (attempt - 1))
+
+        if not success:
+            raise RuntimeError(
+                f"Failed to upload {os.path.basename(file_path)} after "
+                f"{MAX_RETRIES} attempts")
 
     # 仅保留最新 Release 以防超出 Gitee 仓库配额
     try:
