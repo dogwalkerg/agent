@@ -1,5 +1,6 @@
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import hashlib
 from github import Auth, Github
@@ -26,20 +27,21 @@ def get_github_latest_release():
         print(f"Latest release tag is: {release.tag_name}", flush=True)
         print(f"Latest release info is: {release.body}", flush=True)
         files = []
-        download_session = requests.Session()
         download_headers = {'Accept': 'application/octet-stream'}
         if github_token:
             download_headers['Authorization'] = f'Bearer {github_token}'
-        for asset in release.get_assets():
-            url = asset.browser_download_url
-            name = asset.name
+        assets = [(asset.browser_download_url, asset.name)
+                  for asset in release.get_assets()]
+
+        def download_asset(item):
+            url, name = item
             print(f"Downloading {name}", flush=True)
-            response = None
             for attempt in range(1, MAX_RETRIES + 1):
+                response = None
                 try:
                     started_at = time.monotonic()
                     downloaded_bytes = 0
-                    response = download_session.get(
+                    response = requests.get(
                         url, headers=download_headers, allow_redirects=True,
                         stream=True, timeout=(10, 120))
                     response.raise_for_status()
@@ -51,26 +53,27 @@ def get_github_latest_release():
                                 if time.monotonic() - started_at > DOWNLOAD_DEADLINE:
                                     raise requests.exceptions.Timeout(
                                         f"download exceeded {DOWNLOAD_DEADLINE}s")
-                                if downloaded_bytes % (10 * 1024 * 1024) < len(chunk):
-                                    print(
-                                        f"Downloading {name}: {downloaded_bytes // (1024 * 1024)} MiB",
-                                        flush=True)
-                    print(f"Downloaded {name}")
-                    break
+                    print(f"Downloaded {name} ({downloaded_bytes // (1024 * 1024)} MiB)", flush=True)
+                    return name
                 except (OSError, requests.exceptions.RequestException) as err:
                     status = 'no response' if response is None else str(response.status_code)
                     print(
                         f"Download {name} failed (HTTP {status}, attempt "
-                        f"{attempt}/{MAX_RETRIES}): {err}")
+                        f"{attempt}/{MAX_RETRIES}): {err}", flush=True)
                     if attempt == MAX_RETRIES:
                         raise RuntimeError(
                             f"Failed to download {name} after {MAX_RETRIES} attempts") from err
                     time.sleep(2 ** (attempt - 1))
-            file_abs_path = get_abs_path(asset.name)
-            if not os.path.isfile(file_abs_path):
-                raise RuntimeError(f"Downloaded asset is missing: {file_abs_path}")
-            files.append(file_abs_path)
-        download_session.close()
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(download_asset, item) for item in assets]
+            for future in as_completed(futures):
+                name = future.result()
+                file_abs_path = get_abs_path(name)
+                if not os.path.isfile(file_abs_path):
+                    raise RuntimeError(f"Downloaded asset is missing: {file_abs_path}")
+                files.append(file_abs_path)
+        files.sort()
         print('Checking file integrities')
         verify_checksum(get_abs_path("checksums.txt"))
         for owner, repo, token_name in GITEE_REPOSITORIES:
