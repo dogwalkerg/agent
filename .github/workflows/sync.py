@@ -86,8 +86,7 @@ def sync_to_gitee(
     release_api_uri = f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases"
     api_client = requests.Session()
     api_client.headers.update({
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
+        'Accept': 'application/json'
     })
 
     access_token = os.environ.get(token_name, '').strip()
